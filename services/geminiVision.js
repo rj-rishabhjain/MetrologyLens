@@ -16,8 +16,11 @@
 
 // ── Constants ───────────────────────────────────────────────────────────────
 
-const GEMINI_MODEL = "gemini-2.5-flash";
+const MODELS = ['gemini-3.5-flash', 'gemini-3.5-flash-lite', 'gemini-3.8-flash', 'gemini-flash-latest'];
 const GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/models";
+
+/** HTTP status codes (and error keywords) that warrant trying the next model. */
+const FALLBACK_STATUSES = new Set([503, 429, 404]);
 
 /**
  * Structured prompt that instructs Gemini to act as a Legal Metrology
@@ -119,39 +122,68 @@ export async function analyzePackageImage(base64Image, mimeType = "image/jpeg") 
     generationConfig: {
       responseMimeType: "application/json",
       temperature: 0.1,
-      // Keep output focused; large labels rarely need more than 1024 tokens.
-      maxOutputTokens: 1024,
+      maxOutputTokens: 8192,
     },
   };
 
-  // ── 3. Call the Gemini REST API ────────────────────────────────────────────
-  const endpoint = `${GEMINI_BASE_URL}/${GEMINI_MODEL}:generateContent?key=${apiKey}`;
-
+  // ── 3. Try each model in order, falling back on 503 / 429 / 404 ───────────
   let response;
-  try {
-    response = await fetch(endpoint, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(requestBody),
-    });
-  } catch (networkError) {
-    throw new Error(
-      `[MetrologyLens] Network request to Gemini failed: ${networkError.message}`
-    );
+  let lastError;
+
+  for (const model of MODELS) {
+    const endpoint = `${GEMINI_BASE_URL}/${model}:generateContent?key=${apiKey}`;
+
+    try {
+      response = await fetch(endpoint, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(requestBody),
+      });
+    } catch (networkError) {
+      throw new Error(
+        `[MetrologyLens] Network request to Gemini failed: ${networkError.message}`
+      );
+    }
+
+    // ── 4. Check for retryable HTTP errors ──────────────────────────────────
+    if (FALLBACK_STATUSES.has(response.status)) {
+      let hint = "";
+      try {
+        const errBody = await response.json();
+        hint = errBody?.error?.message ?? "";
+      } catch (_) {
+        hint = await response.text().catch(() => "");
+      }
+      console.warn(
+        `[MetrologyLens] Model "${model}" returned ${response.status}${hint ? ` (${hint.slice(0, 120)})` : ""}. Trying next model…`
+      );
+      lastError = new Error(
+        `[MetrologyLens] Gemini API error ${response.status} on model "${model}": ${hint}`
+      );
+      response = null;
+      continue; // try the next model
+    }
+
+    // Non-retryable HTTP error — surface immediately
+    if (!response.ok) {
+      let errorDetails = "";
+      try {
+        const errBody = await response.json();
+        errorDetails = errBody?.error?.message ?? JSON.stringify(errBody);
+      } catch (_) {
+        errorDetails = await response.text().catch(() => "");
+      }
+      throw new Error(
+        `[MetrologyLens] Gemini API error ${response.status}: ${errorDetails}`
+      );
+    }
+
+    // Successful response — break out of the loop
+    break;
   }
 
-  // ── 4. Handle HTTP errors ──────────────────────────────────────────────────
-  if (!response.ok) {
-    let errorDetails = "";
-    try {
-      const errBody = await response.json();
-      errorDetails = errBody?.error?.message ?? JSON.stringify(errBody);
-    } catch (_) {
-      errorDetails = await response.text().catch(() => "");
-    }
-    throw new Error(
-      `[MetrologyLens] Gemini API error ${response.status}: ${errorDetails}`
-    );
+  if (!response) {
+    throw lastError ?? new Error("[MetrologyLens] All Gemini models failed to respond.");
   }
 
   // ── 5. Parse the response ──────────────────────────────────────────────────
